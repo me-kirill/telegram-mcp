@@ -6,7 +6,7 @@ import asyncio
 import sqlite3
 import logging
 import mimetypes
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import List, Dict, Optional, Union, Any
 
@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pythonjsonlogger import jsonlogger
-from telethon import TelegramClient, functions, utils
+from telethon import TelegramClient, functions, utils, events
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     User,
@@ -32,10 +32,24 @@ from telethon.tl.types import (
     InputPeerUser,
     InputPeerChat,
     InputPeerChannel,
+    PeerChannel,
+    UpdateNewMessage,
+    UpdateNewChannelMessage,
+    UpdateEditMessage,
+    UpdateEditChannelMessage,
+    UpdateDeleteMessages,
+    UpdateDeleteChannelMessages,
+    updates,
 )
 import re
 from functools import wraps
 import telethon.errors.rpcerrorlist
+from storage import (
+    SQLiteStore,
+    build_chat_record,
+    build_message_record,
+    decode_db_bytes,
+)
 
 
 class ValidationError(Exception):
@@ -67,10 +81,12 @@ mcp = FastMCP("telegram")
 
 if SESSION_STRING:
     # Use the string session if available
-    client = TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    telegram_client = TelegramClient(
+        StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH
+    )
 else:
     # Use file-based session
-    client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    telegram_client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")
@@ -109,6 +125,363 @@ except Exception as log_error:
     # Fallback to console-only logging
     logger.addHandler(console_handler)
     logger.error(f"Failed to set up log file handler: {log_error}")
+
+# SQLite storage
+DB_PATH = os.getenv("TELEGRAM_MCP_DB_PATH", os.path.join(script_dir, "telegram_mcp.sqlite3"))
+store = SQLiteStore(DB_PATH)
+store.init_schema()
+
+
+class StoreBackedClient:
+    def __init__(self, raw_client: TelegramClient, store: SQLiteStore) -> None:
+        self.raw = raw_client
+        self.store = store
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.raw, name)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.raw(*args, **kwargs)
+
+    def _safe_setattr(self, obj: Any, name: str, value: Any) -> None:
+        try:
+            setattr(obj, name, value)
+        except Exception:
+            try:
+                object.__setattr__(obj, name, value)
+            except Exception:
+                return
+
+    def _parse_payload(self, raw_json: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not raw_json:
+            return None
+        try:
+            return json.loads(raw_json)
+        except json.JSONDecodeError:
+            return None
+
+    def _peer_id_to_raw_id(self, peer_id: int) -> int:
+        if peer_id <= -1000000000000:
+            return -peer_id - 1000000000000
+        if peer_id < 0:
+            return -peer_id
+        return peer_id
+
+    def _resolve_chat_id(self, entity: Any) -> Optional[int]:
+        if isinstance(entity, (int, str)):
+            return resolve_chat_identifier(entity)
+        if hasattr(entity, "id"):
+            return resolve_chat_identifier(getattr(entity, "id"))
+        return None
+
+    def _buttons_from_payload(
+        self, payload: Optional[Dict[str, Any]]
+    ) -> Optional[List[List[Any]]]:
+        if not payload:
+            return None
+        reply_markup = payload.get("reply_markup")
+        if not isinstance(reply_markup, dict):
+            return None
+        rows = reply_markup.get("rows") or []
+        output_rows: List[List[Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            buttons = row.get("buttons") or []
+            row_buttons = []
+            for button in buttons:
+                if not isinstance(button, dict):
+                    continue
+                text = button.get("text") or ""
+                data = button.get("data")
+                if data is not None:
+                    decoded = decode_db_bytes(data)
+                    if decoded is not None:
+                        data = decoded
+                url = button.get("url")
+                raw_button = type("RawButton", (), {"url": url})()
+                row_buttons.append(
+                    type("Button", (), {"text": text, "data": data, "button": raw_button})()
+                )
+            if row_buttons:
+                output_rows.append(row_buttons)
+        return output_rows or None
+
+    def _message_from_row(self, row: Dict[str, Any]) -> Any:
+        if not row:
+            return None
+        payload = self._parse_payload(row.get("raw_json"))
+
+        reply_to_id = row.get("reply_to_msg_id")
+        if reply_to_id is None and payload:
+            reply_payload = payload.get("reply_to")
+            if isinstance(reply_payload, dict):
+                reply_to_id = reply_payload.get("reply_to_msg_id")
+
+        reply_to = None
+        if reply_to_id is not None:
+            reply_to = type("Reply", (), {"reply_to_msg_id": reply_to_id})()
+
+        sender = None
+        sender_name = row.get("sender_name")
+        if sender_name:
+            name_parts = sender_name.split(" ", 1)
+            sender = type(
+                "Sender",
+                (),
+                {
+                    "first_name": name_parts[0],
+                    "last_name": name_parts[1] if len(name_parts) > 1 else "",
+                    "title": sender_name,
+                },
+            )()
+
+        media = None
+        if payload and payload.get("media") is not None:
+            media = payload.get("media")
+        elif row.get("has_media"):
+            media_type = row.get("media_type") or "Media"
+            media = type(media_type, (), {})()
+
+        date = None
+        if row.get("date") is not None:
+            date = datetime.fromtimestamp(row["date"], tz=timezone.utc)
+
+        buttons = self._buttons_from_payload(payload)
+
+        return type(
+            "StoreMessage",
+            (),
+            {
+                "id": row["message_id"],
+                "message": row.get("text") or "",
+                "date": date,
+                "reply_to": reply_to,
+                "sender": sender,
+                "sender_id": row.get("sender_id"),
+                "media": media,
+                "pinned": bool(row.get("pinned")),
+                "out": bool(row.get("out")),
+                "chat_id": row.get("chat_id"),
+                "buttons": buttons,
+            },
+        )()
+
+    def _entity_from_row(self, row: Dict[str, Any]) -> Any:
+        if row is None:
+            return None
+
+        peer_id = row["id"]
+        payload = self._parse_payload(row.get("raw_json"))
+        is_channel_like = peer_id <= -1000000000000
+        if payload and payload.get("_") in {"Channel", "ChannelForbidden"}:
+            is_channel_like = True
+
+        if row.get("type") == "user":
+            entity = User.__new__(User)
+            entity_id = self._peer_id_to_raw_id(peer_id)
+            name = row.get("title") or ""
+            name_parts = name.split(" ", 1)
+            self._safe_setattr(entity, "id", entity_id)
+            self._safe_setattr(entity, "first_name", name_parts[0] if name_parts else "")
+            self._safe_setattr(
+                entity,
+                "last_name",
+                name_parts[1] if len(name_parts) > 1 else "",
+            )
+            self._safe_setattr(entity, "username", row.get("username"))
+            self._safe_setattr(entity, "phone", row.get("phone"))
+            if row.get("is_bot") is not None:
+                self._safe_setattr(entity, "bot", bool(row.get("is_bot")))
+            if row.get("is_verified") is not None:
+                self._safe_setattr(entity, "verified", bool(row.get("is_verified")))
+            return entity
+
+        if row.get("type") == "channel" or is_channel_like:
+            entity = Channel.__new__(Channel)
+            entity_id = self._peer_id_to_raw_id(peer_id)
+            broadcast = row.get("type") == "channel"
+            self._safe_setattr(entity, "id", entity_id)
+            self._safe_setattr(entity, "title", row.get("title") or "Unknown")
+            self._safe_setattr(entity, "username", row.get("username"))
+            self._safe_setattr(entity, "broadcast", bool(broadcast))
+            self._safe_setattr(entity, "megagroup", bool(not broadcast))
+            return entity
+
+        entity = Chat.__new__(Chat)
+        entity_id = self._peer_id_to_raw_id(peer_id)
+        self._safe_setattr(entity, "id", entity_id)
+        self._safe_setattr(entity, "title", row.get("title") or "Unknown")
+        return entity
+
+    def _dialog_from_row(self, row: Dict[str, Any]) -> Any:
+        entity = self._entity_from_row(row)
+        last_msg = self.store.get_last_message(row["id"])
+        message = self._message_from_row(last_msg) if last_msg else None
+        return type(
+            "StoreDialog",
+            (),
+            {
+                "entity": entity,
+                "unread_count": row.get("unread_count") or 0,
+                "message": message,
+                "id": getattr(entity, "id", row["id"]),
+            },
+        )()
+
+    async def get_dialogs(self, limit: Optional[int] = None, **kwargs: Any) -> List[Any]:
+        offset_peer = kwargs.get("offset_peer")
+        if offset_peer is not None:
+            chat_id = self._resolve_chat_id(offset_peer)
+            if chat_id is None:
+                return []
+            row = self.store.get_chat_by_id(chat_id)
+            if not row:
+                return []
+            return [self._dialog_from_row(row)]
+
+        if limit == 0:
+            return []
+
+        if limit is None:
+            rows = self.store.conn.execute(
+                """
+                SELECT * FROM chats
+                ORDER BY COALESCE(last_message_date, 0) DESC, id DESC
+                """
+            ).fetchall()
+            rows = [dict(row) for row in rows]
+        else:
+            rows = self.store.get_chats(page=1, page_size=limit)
+        return [self._dialog_from_row(row) for row in rows]
+
+    async def get_messages(
+        self,
+        entity: Any,
+        limit: int = 20,
+        add_offset: int = 0,
+        ids: Optional[Union[int, List[int]]] = None,
+        search: Optional[str] = None,
+        max_id: Optional[int] = None,
+        min_id: Optional[int] = None,
+        reverse: bool = False,
+        filter: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> Any:
+        chat_id = self._resolve_chat_id(entity)
+
+        if chat_id is None:
+            return [] if ids is None else None
+
+        if ids is not None:
+            if isinstance(ids, list):
+                messages = []
+                for msg_id in ids:
+                    row = self.store.get_message(chat_id, msg_id)
+                    if row:
+                        messages.append(self._message_from_row(row))
+                return messages
+            row = self.store.get_message(chat_id, ids)
+            return self._message_from_row(row)
+
+        pinned_only = False
+        if filter is not None:
+            try:
+                from telethon.tl.types import InputMessagesFilterPinned
+
+                if isinstance(filter, InputMessagesFilterPinned):
+                    pinned_only = True
+            except Exception:
+                pinned_only = False
+
+        rows = self._fetch_message_rows(
+            chat_id=chat_id,
+            limit=limit,
+            offset=add_offset,
+            search=search,
+            max_id=max_id,
+            min_id=min_id,
+            reverse=reverse,
+            pinned_only=pinned_only,
+        )
+        return [self._message_from_row(row) for row in rows]
+
+    def _fetch_message_rows(
+        self,
+        chat_id: int,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        search: Optional[str] = None,
+        max_id: Optional[int] = None,
+        min_id: Optional[int] = None,
+        reverse: bool = False,
+        offset_date: Optional[datetime] = None,
+        pinned_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        conditions = ["chat_id = ?"]
+        params: List[Any] = [chat_id]
+
+        if search:
+            conditions.append("text LIKE ? COLLATE NOCASE")
+            params.append(f"%{search}%")
+        if max_id is not None:
+            conditions.append("message_id < ?")
+            params.append(max_id)
+        if min_id is not None:
+            conditions.append("message_id > ?")
+            params.append(min_id)
+        if offset_date is not None:
+            if offset_date.tzinfo is None:
+                offset_date = offset_date.replace(tzinfo=timezone.utc)
+            offset_ts = int(offset_date.timestamp())
+            conditions.append("date >= ?" if reverse else "date < ?")
+            params.append(offset_ts)
+        if pinned_only:
+            conditions.append("pinned = 1")
+
+        where_clause = " AND ".join(conditions)
+        order = "date ASC, message_id ASC" if reverse else "date DESC, message_id DESC"
+        query = f"SELECT * FROM messages WHERE {where_clause} ORDER BY {order}"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+            if offset:
+                query += " OFFSET ?"
+                params.append(offset)
+        elif offset:
+            query += " LIMIT -1 OFFSET ?"
+            params.append(offset)
+
+        rows = self.store.conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    async def iter_messages(self, entity: Any, limit: int = 100, **kwargs: Any) -> Any:
+        chat_id = self._resolve_chat_id(entity)
+
+        if chat_id is None:
+            return
+
+        search = kwargs.get("search")
+        offset_date = kwargs.get("offset_date")
+        reverse = bool(kwargs.get("reverse", False))
+        max_id = kwargs.get("max_id")
+        min_id = kwargs.get("min_id")
+
+        rows = self._fetch_message_rows(
+            chat_id=chat_id,
+            limit=limit,
+            offset=0,
+            search=search,
+            max_id=max_id,
+            min_id=min_id,
+            reverse=reverse,
+            offset_date=offset_date,
+        )
+        for row in rows:
+            yield self._message_from_row(row)
+
+
+client = StoreBackedClient(telegram_client, store)
 
 
 # Error code prefix mapping for better error tracing
@@ -317,6 +690,297 @@ def get_sender_name(message) -> str:
         return "Unknown"
 
 
+def format_db_date(timestamp: Optional[int]) -> str:
+    if timestamp is None:
+        return "Unknown"
+    return datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def resolve_chat_identifier(chat_id: Union[int, str]) -> Optional[int]:
+    if isinstance(chat_id, int):
+        if store.get_chat_by_id(chat_id):
+            return chat_id
+        if chat_id > 0:
+            candidate = -chat_id
+            if store.get_chat_by_id(candidate):
+                return candidate
+            channel_candidate = -1000000000000 - chat_id
+            if store.get_chat_by_id(channel_candidate):
+                return channel_candidate
+        if chat_id < 0:
+            candidate = -chat_id
+            if store.get_chat_by_id(candidate):
+                return candidate
+            if chat_id <= -1000000000000:
+                channel_candidate = -chat_id - 1000000000000
+                if store.get_chat_by_id(channel_candidate):
+                    return channel_candidate
+        return None
+    if isinstance(chat_id, str):
+        trimmed = chat_id.strip()
+        if trimmed.lstrip("-").isdigit():
+            numeric = int(trimmed)
+            if store.get_chat_by_id(numeric):
+                return numeric
+            if numeric > 0:
+                candidate = -numeric
+                if store.get_chat_by_id(candidate):
+                    return candidate
+                channel_candidate = -1000000000000 - numeric
+                if store.get_chat_by_id(channel_candidate):
+                    return channel_candidate
+            if numeric < 0:
+                candidate = -numeric
+                if store.get_chat_by_id(candidate):
+                    return candidate
+                if numeric <= -1000000000000:
+                    channel_candidate = -numeric - 1000000000000
+                    if store.get_chat_by_id(channel_candidate):
+                        return channel_candidate
+            return None
+        row = store.get_chat_by_username(trimmed)
+        if row:
+            return row["id"]
+    return None
+
+
+def get_chat_row(chat_id: Union[int, str]) -> Optional[Dict[str, Any]]:
+    resolved_id = resolve_chat_identifier(chat_id)
+    if resolved_id is None:
+        return None
+    return store.get_chat_by_id(resolved_id)
+
+
+def extract_inline_buttons(raw_json: str) -> List[Dict[str, Any]]:
+    try:
+        payload = json.loads(raw_json) if raw_json else {}
+    except json.JSONDecodeError:
+        return []
+
+    reply_markup = payload.get("reply_markup") or {}
+    rows = reply_markup.get("rows") or []
+    buttons: List[Dict[str, Any]] = []
+
+    for row in rows:
+        for button in row.get("buttons", []) or []:
+            text = button.get("text") or "<no text>"
+            url = button.get("url")
+            data_raw = button.get("data")
+            data_bytes = decode_db_bytes(data_raw)
+            buttons.append(
+                {
+                    "text": text,
+                    "url": url,
+                    "data": data_bytes,
+                }
+            )
+
+    return buttons
+
+
+def _normalize_state_date(state_date: Any) -> int:
+    if isinstance(state_date, datetime):
+        if state_date.tzinfo is None:
+            state_date = state_date.replace(tzinfo=timezone.utc)
+        return int(state_date.timestamp())
+    return int(state_date)
+
+
+def _load_updates_state() -> Optional[Dict[str, int]]:
+    pts = store.get_meta_int("updates_pts")
+    qts = store.get_meta_int("updates_qts")
+    date = store.get_meta_int("updates_date")
+    seq = store.get_meta_int("updates_seq")
+    if pts is None or qts is None or date is None:
+        return None
+    return {"pts": pts, "qts": qts, "date": date, "seq": seq or 0}
+
+
+def _save_updates_state(pts: int, qts: int, date: int, seq: int) -> None:
+    store.set_meta_int("updates_pts", pts)
+    store.set_meta_int("updates_qts", qts)
+    store.set_meta_int("updates_date", date)
+    store.set_meta_int("updates_seq", seq)
+
+
+def _peer_id_from_channel_id(channel_id: int) -> int:
+    return utils.get_peer_id(PeerChannel(channel_id))
+
+
+def _apply_message_record(record: Dict[str, Any], increment_unread: bool = True) -> None:
+    if not record.get("chat_id"):
+        return
+    store.upsert_message_record(record)
+    if increment_unread and not record.get("out"):
+        store.increment_unread(record["chat_id"])
+
+
+def _apply_difference_update(update: Any) -> None:
+    if isinstance(update, (UpdateNewMessage, UpdateNewChannelMessage)):
+        msg = getattr(update, "message", None)
+        if msg:
+            record = build_message_record(msg)
+            if record.get("chat_id") is None and getattr(update, "channel_id", None):
+                record["chat_id"] = _peer_id_from_channel_id(update.channel_id)
+            _apply_message_record(record, increment_unread=True)
+        return
+
+    if isinstance(update, (UpdateEditMessage, UpdateEditChannelMessage)):
+        msg = getattr(update, "message", None)
+        if msg:
+            record = build_message_record(msg)
+            if record.get("chat_id") is None and getattr(update, "channel_id", None):
+                record["chat_id"] = _peer_id_from_channel_id(update.channel_id)
+            _apply_message_record(record, increment_unread=False)
+        return
+
+    if isinstance(update, UpdateDeleteChannelMessages):
+        chat_id = _peer_id_from_channel_id(update.channel_id)
+        store.delete_messages(chat_id, update.messages)
+        return
+
+    if isinstance(update, UpdateDeleteMessages):
+        for message_id in update.messages:
+            chat_ids = store.find_chat_ids_by_message_id(message_id)
+            if len(chat_ids) == 1:
+                store.delete_messages(chat_ids[0], [message_id])
+            elif len(chat_ids) > 1:
+                logger.warning("Ambiguous delete for message %s in chats %s", message_id, chat_ids)
+
+
+async def sync_chats_from_telegram(limit: Optional[int] = None) -> None:
+    dialogs = await client.raw.get_dialogs(limit=limit)
+    for dialog in dialogs:
+        try:
+            record = build_chat_record(dialog.entity, dialog)
+            store.upsert_chat_record(record)
+            if getattr(dialog, "message", None):
+                msg_record = build_message_record(dialog.message)
+                if msg_record.get("chat_id") is None:
+                    msg_record["chat_id"] = utils.get_peer_id(dialog.entity)
+                store.upsert_message_record(msg_record)
+        except Exception:
+            logger.exception("Failed to persist dialog info")
+
+
+async def sync_new_messages() -> None:
+    saved_state = _load_updates_state()
+    if saved_state is None:
+        state = await client(functions.updates.GetStateRequest())
+        _save_updates_state(
+            state.pts,
+            state.qts,
+            _normalize_state_date(state.date),
+            state.seq,
+        )
+        return
+
+    pts = saved_state["pts"]
+    qts = saved_state["qts"]
+    date = saved_state["date"]
+    seq = saved_state["seq"]
+
+    while True:
+        diff = await client(
+            functions.updates.GetDifferenceRequest(
+                pts=pts,
+                date=date,
+                qts=qts,
+            )
+        )
+
+        if isinstance(diff, updates.DifferenceEmpty):
+            _save_updates_state(
+                pts,
+                qts,
+                _normalize_state_date(diff.date),
+                diff.seq,
+            )
+            break
+
+        if isinstance(diff, updates.DifferenceTooLong):
+            state = await client(functions.updates.GetStateRequest())
+            _save_updates_state(
+                state.pts,
+                state.qts,
+                _normalize_state_date(state.date),
+                state.seq,
+            )
+            break
+
+        for user in getattr(diff, "users", []) or []:
+            store.upsert_chat_record(build_chat_record(user))
+        for chat in getattr(diff, "chats", []) or []:
+            store.upsert_chat_record(build_chat_record(chat))
+
+        for msg in getattr(diff, "new_messages", []) or []:
+            record = build_message_record(msg)
+            _apply_message_record(record, increment_unread=True)
+
+        for update in getattr(diff, "other_updates", []) or []:
+            _apply_difference_update(update)
+
+        next_state = getattr(diff, "intermediate_state", None) or getattr(diff, "state", None)
+        if next_state is None:
+            break
+
+        pts = next_state.pts
+        qts = next_state.qts
+        date = _normalize_state_date(next_state.date)
+        seq = next_state.seq
+        _save_updates_state(pts, qts, date, seq)
+
+        if isinstance(diff, updates.DifferenceSlice):
+            continue
+        break
+
+
+@client.on(events.NewMessage)
+async def _handle_new_message(event: events.NewMessage.Event) -> None:
+    message = event.message
+    if message is None:
+        return
+    try:
+        if getattr(message, "chat", None):
+            store.upsert_chat_record(build_chat_record(message.chat))
+        record = build_message_record(message)
+        if record.get("chat_id") is None:
+            record["chat_id"] = event.chat_id
+        store.upsert_message_record(record)
+        if record.get("chat_id") and not getattr(message, "out", False):
+            store.increment_unread(record["chat_id"])
+    except Exception:
+        logger.exception("Failed to persist new message event")
+
+
+@client.on(events.MessageEdited)
+async def _handle_message_edited(event: events.MessageEdited.Event) -> None:
+    message = event.message
+    if message is None:
+        return
+    try:
+        if getattr(message, "chat", None):
+            store.upsert_chat_record(build_chat_record(message.chat))
+        record = build_message_record(message)
+        if record.get("chat_id") is None:
+            record["chat_id"] = event.chat_id
+        store.upsert_message_record(record)
+    except Exception:
+        logger.exception("Failed to persist edited message event")
+
+
+@client.on(events.MessageDeleted)
+async def _handle_message_deleted(event: events.MessageDeleted.Event) -> None:
+    try:
+        chat_id = event.chat_id
+        if chat_id is None:
+            return
+        deleted_ids = event.deleted_ids or []
+        store.delete_messages(chat_id, deleted_ids)
+    except Exception:
+        logger.exception("Failed to persist deleted message event")
+
+
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
 async def get_chats(page: int = 1, page_size: int = 20) -> str:
     """
@@ -386,7 +1050,14 @@ async def send_message(chat_id: Union[int, str], message: str) -> str:
     """
     try:
         entity = await client.get_entity(chat_id)
-        await client.send_message(entity, message)
+        sent = await client.send_message(entity, message)
+        if sent:
+            record = build_message_record(sent)
+            if record.get("chat_id") is None:
+                resolved_id = resolve_chat_identifier(chat_id)
+                if resolved_id is not None:
+                    record["chat_id"] = resolved_id
+            store.upsert_message_record(record)
         return "Message sent successfully."
     except Exception as e:
         return log_and_format_error("send_message", e, chat_id=chat_id)
@@ -428,7 +1099,6 @@ async def list_inline_buttons(
                 message_id = int(message_id)
             else:
                 return "message_id must be an integer."
-
         entity = await client.get_entity(chat_id)
         target_message = None
 
@@ -648,6 +1318,153 @@ async def search_contacts(query: str) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+async def search_messages_by_sender(
+    sender: Union[int, str],
+    limit: int = 50,
+    page: int = 1,
+    search_query: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+) -> str:
+    """
+    Search messages from a specific sender across ALL chats.
+
+    Args:
+        sender: The sender to search for. Can be:
+            - User ID (integer or string): 123456789 or "123456789"
+            - Username: "@username" or "username"
+            - Name: "Владлен" (may match multiple people - you'll be prompted to choose)
+        limit: Maximum number of messages per page (default 50, max 200).
+        page: Page number for pagination (1-indexed).
+        search_query: Optional text to filter messages containing this text.
+        from_date: Filter messages from this date (format: YYYY-MM-DD).
+        to_date: Filter messages until this date (format: YYYY-MM-DD).
+
+    Returns:
+        Messages from the specified sender across all chats, showing which
+        chat each message is from. If sender name matches multiple people,
+        returns the list of matches to choose from.
+    """
+    try:
+        # Validate limit and page
+        limit = min(max(limit, 1), 200)
+        page = max(page, 1)
+        offset = (page - 1) * limit
+
+        # Step 1: Resolve sender to ID(s)
+        matches = store.find_senders_by_identifier(sender)
+
+        if not matches:
+            # Try Telegram API lookup as fallback
+            try:
+                entity = await client.raw.get_entity(sender)
+                if isinstance(entity, User):
+                    # Cache it
+                    store.upsert_chat_record(build_chat_record(entity))
+                    name = f"{entity.first_name or ''} {entity.last_name or ''}".strip()
+                    matches = [{"id": entity.id, "title": name or "Unknown"}]
+            except Exception:
+                pass
+
+        if not matches:
+            return (
+                f"No sender found matching '{sender}'. "
+                "Try using an ID, @username, or an exact name."
+            )
+
+        # Step 2: Handle multiple matches (ambiguous name search)
+        if len(matches) > 1:
+            lines = [
+                f"Multiple users found matching '{sender}'. Please specify by ID or username:\n"
+            ]
+            for match in matches[:10]:  # Limit to 10 suggestions
+                info = f"  ID: {match['id']}, Name: {match.get('title', 'Unknown')}"
+                if match.get("username"):
+                    info += f", Username: @{match['username']}"
+                lines.append(info)
+            if len(matches) > 10:
+                lines.append(f"\n  ... and {len(matches) - 10} more matches")
+            return "\n".join(lines)
+
+        # Single match - proceed with search
+        sender_id = matches[0]["id"]
+        sender_name = matches[0].get("title", "Unknown")
+
+        # Step 3: Parse date filters
+        from_ts = None
+        to_ts = None
+
+        if from_date:
+            try:
+                from_date_obj = datetime.strptime(from_date, "%Y-%m-%d")
+                from_date_obj = from_date_obj.replace(tzinfo=timezone.utc)
+                from_ts = int(from_date_obj.timestamp())
+            except ValueError:
+                return "Invalid from_date format. Use YYYY-MM-DD."
+
+        if to_date:
+            try:
+                to_date_obj = datetime.strptime(to_date, "%Y-%m-%d")
+                to_date_obj = to_date_obj.replace(tzinfo=timezone.utc) + timedelta(
+                    days=1, microseconds=-1
+                )
+                to_ts = int(to_date_obj.timestamp())
+            except ValueError:
+                return "Invalid to_date format. Use YYYY-MM-DD."
+
+        # Step 4: Query messages
+        messages = store.search_messages_by_sender(
+            sender_ids=[sender_id],
+            limit=limit,
+            offset=offset,
+            search_query=search_query,
+            from_ts=from_ts,
+            to_ts=to_ts,
+        )
+
+        if not messages:
+            filter_info = []
+            if search_query:
+                filter_info.append(f"containing '{search_query}'")
+            if from_date:
+                filter_info.append(f"from {from_date}")
+            if to_date:
+                filter_info.append(f"until {to_date}")
+            filter_str = " ".join(filter_info) if filter_info else ""
+            return f"No messages found from {sender_name} (ID: {sender_id}) {filter_str}."
+
+        # Step 5: Get total count for pagination info
+        total_count = store.count_messages_by_sender(
+            sender_ids=[sender_id],
+            search_query=search_query,
+            from_ts=from_ts,
+            to_ts=to_ts,
+        )
+        total_pages = (total_count + limit - 1) // limit
+
+        # Step 6: Format output
+        lines = [f"Messages from {sender_name} (ID: {sender_id})"]
+        lines.append(f"Page {page}/{total_pages} ({total_count} total messages)\n")
+
+        for msg in messages:
+            chat_title = msg.get("chat_title") or "Unknown Chat"
+            date_str = format_db_date(msg.get("date"))
+            text = msg.get("text") or "[Media/No text]"
+            reply_info = ""
+            if msg.get("reply_to_msg_id"):
+                reply_info = f" | reply to {msg['reply_to_msg_id']}"
+
+            lines.append(
+                f"[{chat_title}] ID: {msg['message_id']} | {date_str}{reply_info}\n{text}\n"
+            )
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return log_and_format_error("search_messages_by_sender", e, sender=sender)
+
+
+@mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
 async def get_contact_ids() -> str:
     """
     Get all contact IDs in your Telegram account.
@@ -782,6 +1599,94 @@ async def list_messages(
         return "\n".join(lines)
     except Exception as e:
         return log_and_format_error("list_messages", e, chat_id=chat_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(openWorldHint=True, idempotentHint=True, destructiveHint=True)
+)
+@validate_id("chat_ids")
+async def initialize_db(
+    limit_per_chat: int = 5000,
+    since_days: Optional[int] = None,
+    since_date: Optional[str] = None,
+    chat_ids: Optional[List[Union[int, str]]] = None,
+) -> str:
+    """
+    Initialize the local SQLite cache by loading message history.
+
+    Args:
+        limit_per_chat: Max messages per chat to load.
+        since_days: Load messages from the last N days (UTC).
+        since_date: Load messages since this date (YYYY-MM-DD). Overrides since_days if provided.
+        chat_ids: Optional list of chat IDs/usernames to initialize. If omitted, initializes all dialogs.
+    """
+    try:
+        if limit_per_chat <= 0:
+            return "limit_per_chat must be a positive integer."
+
+        since_dt = None
+        if since_date:
+            try:
+                since_dt = datetime.strptime(since_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                return "Invalid since_date format. Use YYYY-MM-DD."
+        elif since_days is not None:
+            if since_days <= 0:
+                return "since_days must be a positive integer."
+            since_dt = datetime.now(timezone.utc) - timedelta(days=since_days)
+
+        chats_to_sync: List[Any] = []
+        if chat_ids:
+            for chat_id in chat_ids:
+                try:
+                    entity = await client.get_entity(chat_id)
+                    store.upsert_chat_record(build_chat_record(entity))
+                    chats_to_sync.append(entity)
+                except Exception:
+                    logger.exception("Failed to resolve chat %s during initialization", chat_id)
+        else:
+            dialogs = await client.raw.get_dialogs()
+            for dialog in dialogs:
+                try:
+                    store.upsert_chat_record(build_chat_record(dialog.entity, dialog))
+                    chats_to_sync.append(dialog.entity)
+                except Exception:
+                    logger.exception("Failed to persist dialog during initialization")
+
+        if not chats_to_sync:
+            return "No chats found to initialize."
+
+        summary_lines = []
+        for entity in chats_to_sync:
+            chat_id = utils.get_peer_id(entity)
+            count = 0
+            batch: List[Dict[str, Any]] = []
+
+            if since_dt:
+                iterator = client.raw.iter_messages(entity, offset_date=since_dt, reverse=True)
+            else:
+                iterator = client.raw.iter_messages(entity, limit=limit_per_chat, reverse=True)
+
+            async for msg in iterator:
+                record = build_message_record(msg)
+                if record.get("chat_id") is None:
+                    record["chat_id"] = chat_id
+                batch.append(record)
+                count += 1
+                if len(batch) >= 200:
+                    store.upsert_messages(batch)
+                    batch.clear()
+                if since_dt and count >= limit_per_chat:
+                    break
+
+            if batch:
+                store.upsert_messages(batch)
+
+            summary_lines.append(f"Chat {chat_id}: {count} messages")
+
+        return "Initialization complete:\n" + "\n".join(summary_lines)
+    except Exception as e:
+        return log_and_format_error("initialize_db", e)
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
@@ -1390,7 +2295,7 @@ async def create_group(title: str, user_ids: List[Union[int, str]]) -> str:
                 # If we can't determine the chat ID directly from the result
                 # Try to find it in recent dialogs
                 await asyncio.sleep(1)  # Give Telegram a moment to register the new group
-                dialogs = await client.get_dialogs(limit=5)  # Get recent dialogs
+                dialogs = await client.raw.get_dialogs(limit=5)  # Get recent dialogs
                 for dialog in dialogs:
                     if dialog.title == title:
                         return f"Group created with ID: {dialog.id}"
@@ -1598,7 +2503,7 @@ async def download_media(chat_id: Union[int, str], message_id: int, file_path: s
     """
     try:
         entity = await client.get_entity(chat_id)
-        msg = await client.get_messages(entity, ids=message_id)
+        msg = await client.raw.get_messages(entity, ids=message_id)
         if not msg or not msg.media:
             return "No media found in the specified message."
         # Check if directory is writable
@@ -2457,7 +3362,14 @@ async def edit_message(chat_id: Union[int, str], message_id: int, new_text: str)
     """
     try:
         entity = await client.get_entity(chat_id)
-        await client.edit_message(entity, message_id, new_text)
+        edited = await client.edit_message(entity, message_id, new_text)
+        if edited:
+            record = build_message_record(edited)
+            if record.get("chat_id") is None:
+                resolved_id = resolve_chat_identifier(chat_id)
+                if resolved_id is not None:
+                    record["chat_id"] = resolved_id
+            store.upsert_message_record(record)
         return f"Message {message_id} edited."
     except Exception as e:
         return log_and_format_error(
@@ -2476,6 +3388,9 @@ async def delete_message(chat_id: Union[int, str], message_id: int) -> str:
     try:
         entity = await client.get_entity(chat_id)
         await client.delete_messages(entity, message_id)
+        resolved_id = resolve_chat_identifier(chat_id)
+        if resolved_id is not None:
+            store.delete_messages(resolved_id, [message_id])
         return f"Message {message_id} deleted."
     except Exception as e:
         return log_and_format_error("delete_message", e, chat_id=chat_id, message_id=message_id)
@@ -2492,6 +3407,9 @@ async def pin_message(chat_id: Union[int, str], message_id: int) -> str:
     try:
         entity = await client.get_entity(chat_id)
         await client.pin_message(entity, message_id)
+        resolved_id = resolve_chat_identifier(chat_id)
+        if resolved_id is not None:
+            store.set_message_pinned(resolved_id, message_id, True)
         return f"Message {message_id} pinned in chat {chat_id}."
     except Exception as e:
         return log_and_format_error("pin_message", e, chat_id=chat_id, message_id=message_id)
@@ -2508,6 +3426,9 @@ async def unpin_message(chat_id: Union[int, str], message_id: int) -> str:
     try:
         entity = await client.get_entity(chat_id)
         await client.unpin_message(entity, message_id)
+        resolved_id = resolve_chat_identifier(chat_id)
+        if resolved_id is not None:
+            store.set_message_pinned(resolved_id, message_id, False)
         return f"Message {message_id} unpinned in chat {chat_id}."
     except Exception as e:
         return log_and_format_error("unpin_message", e, chat_id=chat_id, message_id=message_id)
@@ -2524,6 +3445,9 @@ async def mark_as_read(chat_id: Union[int, str]) -> str:
     try:
         entity = await client.get_entity(chat_id)
         await client.send_read_acknowledge(entity)
+        resolved_id = resolve_chat_identifier(chat_id)
+        if resolved_id is not None:
+            store.update_unread_count(resolved_id, 0)
         return f"Marked all messages as read in chat {chat_id}."
     except Exception as e:
         return log_and_format_error("mark_as_read", e, chat_id=chat_id)
@@ -2537,7 +3461,14 @@ async def reply_to_message(chat_id: Union[int, str], message_id: int, text: str)
     """
     try:
         entity = await client.get_entity(chat_id)
-        await client.send_message(entity, text, reply_to=message_id)
+        sent = await client.send_message(entity, text, reply_to=message_id)
+        if sent:
+            record = build_message_record(sent)
+            if record.get("chat_id") is None:
+                resolved_id = resolve_chat_identifier(chat_id)
+                if resolved_id is not None:
+                    record["chat_id"] = resolved_id
+            store.upsert_message_record(record)
         return f"Replied to message {message_id} in chat {chat_id}."
     except Exception as e:
         return log_and_format_error(
@@ -3134,6 +4065,11 @@ async def _main() -> None:
         # Start the Telethon client non-interactively
         print("Starting Telegram client...")
         await client.start()
+
+        print("Telegram client started. Syncing chats...")
+        await sync_chats_from_telegram()
+        print("Syncing new messages...")
+        await sync_new_messages()
 
         print("Telegram client started. Running MCP server...")
         # Use the asynchronous entrypoint instead of mcp.run()
